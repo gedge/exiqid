@@ -1,0 +1,8 @@
+exiqid - the exim queue walker
+
+Interactively step through the exim queue
+(though it is possible to skip groups of queue items).
+
+run
+	exiqid -h
+to see the help

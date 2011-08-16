@@ -1,0 +1,344 @@
+#!/usr/local/bin/bash
+
+spambox=your@address.here
+hambox=your@address.here
+bounce_mid_end=.your.domain.here	# terminator in Message-ID when message is a bounce
+sender=your@address.here		# default address for changing sender
+add_rcpt=$sender
+
+mainlog=/var/log/exim/mainlog
+
+[[ -f ~/.exiqidrc ]] && . ~/.exiqidrc
+
+joey=					# non-interactive JJ
+joe=					# sp-sep list of JJ domains
+jj_sleep=4
+jj_only=
+jj_age=240
+jj_ice=-z
+ignore_dom=
+no_op=
+no_op_pre=
+
+######################################################################
+usage() {
+	echo	"$0 [ -h | --help ] [ -n | --noop ] [ <other_options> ]"
+	echo	"	--jj <ssd>	delete joeys for joe-jobs to these domains"
+	echo	"	--jj-age <secs>	minimum time a joey has to have been on the queue"
+	echo	"			(default is $jj_age)"
+	echo	"	--jj-non-frozen	do not restrict joey deletes to frozen e-mails"
+	echo	"	--jj-sleep <s>	delay before each joey is deleted"
+	echo	"			(default is $jj_sleep)"
+	echo	"	Notes:"
+	echo	"		joey	is a bounce queued to a joe-jobbed domain"
+	echo	"		<ssd>	is a space-separated list of domains"
+	echo	"	Interactive Actions (selected):"
+	echo	"		E	(Exigrep pre-bounce)"
+	echo	"			exigrep for the QID which caused this bounce"
+	echo	"		J	(joe-job)"
+	echo	"			delete all frozen bounces to this domain"
+	echo	"		s	(skip domain)"
+	echo	"			make exiqid ignore e-mails to this domain"
+}
+######################################################################
+
+while [[ -n $1 ]]; do
+	arg=$1
+	shift
+	case $arg in
+		-h|--help)
+			usage
+			exit
+			;;
+		--jj)
+			joe=$1
+			shift
+			joey=1
+			jj_only=1
+			;;
+		--jj-age)
+			jj_age=$1
+			shift
+			;;
+		--jj-non-frozen)
+			jj_ice=
+			;;
+		--jj-sleep)
+			jj_sleep=$1
+			shift
+			;;
+		-n|--noop|--no-op)
+			no_op=1
+			no_op_pre=echo
+			;;
+		*)
+			echo Do not recognise argument $arg >&2
+			usage
+			exit 2
+			;;
+	esac
+done
+######################################################################
+
+confirm() {
+  read -p "Confirm $* [yN] " yorn
+  [[ $yorn = "y" ]] && return 0
+  return 1
+}
+
+confirm_y() {
+  read -p "Confirm $* [Yn] " yorn
+  [[ $yorn = "n" ]] && return 1
+  return 0
+}
+
+re_confirm() {
+	# re_confirm "Do you want fries" fries $fries --fries --no-fries
+	local prompt=$1;	shift
+	local var=$1;		shift
+	local curr_val=$1;	shift
+	local yes_val=$1;	shift
+	local no_val=$1;	shift
+	local re_con
+	local opts=yN
+	[[ $curr_val = $yes_val ]] && opts=Yn
+	while true; do
+		read -p "$prompt [$opts] " re_con
+		new_val=$no_val
+		if [[ $re_con = "" ]]; then
+			[[ $opts = "Yn" ]] && new_val=$yes_val
+		elif [[ $re_con = "y" ]]; then
+			new_val=$yes_val
+		elif [[ $re_con = "n" ]]; then
+			:
+		else
+			continue
+		fi
+		eval $var=\$new_val
+		break
+	done
+}
+
+check_res() {
+	local res=$1;	shift
+	local max=$1;	shift
+	[[ -z $max ]] && max=0
+	if [[ $res -gt $max ]]; then
+		echo $banner
+		echo WARNING Result was: $res
+		return 1
+	else
+		echo Result was: $res
+	fi
+	return 0
+}
+
+do_view() {
+	(
+		exim -Mvh $qid
+		exim -Mvb $qid
+	) 2>&1 | more
+}
+
+do_rm() {
+	confirm remove && exim -Mrm $qid
+}
+
+joe_job() {
+	[[ -z $joe ]] && return 1
+	local res=1
+	local j=
+	local i=
+	local found_me_file=/tmp/jj_fmf_$$
+	[ -f $found_me_file ] && rm $found_me_file
+	for j in $joe; do
+		exiqgrep -f '(?<=<)(?=>)' -r "(?i)@$j" $jj_ice -o $jj_age -i | while read i; do
+			if [[ -n $joey ]]; then
+				mailq $i
+				qid=$i
+			fi
+			if [[ $i = $qid ]]; then
+				echo $i will be DELETED as joe-job for $j
+				[[ $jj_sleep -ne 0 ]] && sleep $jj_sleep
+				$no_op_pre exim -Mrm $qid
+				echo
+				touch $found_me_file
+				[[ -z $joey ]] && break
+			fi
+		done
+		if [[ -f $found_me_file ]]; then
+			rm $found_me_file
+			res=0
+			break
+		fi
+	done
+	return $res
+}
+
+ignore_it() {
+	[[ -z $ignore_dom ]] && return 1
+	local r
+	local ig
+	for r in $(mailq $qid | tail -n +2); do
+		r=${r#*@}
+		test -z "$r" && break
+		r=$(echo "$r"|tr A-Z a-z)
+		for ig in $ignore_dom; do
+			[[ $ig = $r ]] && return 0
+		done
+	done
+	return 1
+}
+
+######################################################################
+
+if [[ -n $joey ]]; then
+	joe_job
+	exit
+fi
+
+banner="@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@"
+countq=$(mailq|grep -c '^$')
+
+count=0
+for qid in $(mailq | perl -ane 'BEGIN{$p=1} print "$F[2]\n" if $p;$p=0;$p=1 if $_ eq "\n"'); do
+	let count++
+	while true; do
+		echo "$count/$countq	$banner"
+		mailq $qid
+		ignore_it && break
+		joe_job && break
+		[[ -n $joe && -n $jj_only ]] && break
+		echo "$qid ... (v)iew, (l)og-view, (e)xigrep, (d)eliver msg, (f)orce deliver"
+		echo "  (t)haw, (r)emove, (m)ark-delivered, (b)ounce, (E)xigrep pre-bounce"
+		echo "  (S)pam (to spam mbox), (R) edit sender, (A)dd rcpt, (J)oe-job (remove all)"
+		read -p "  (s)kip domain (n)ext msg, (q)uit program [vledftrmbESRAJnq] " what
+		if [[ $what = "r" ]]; then
+			do_rm && break
+		elif [[ $what = "d" ]]; then
+			read -p "Debug (e.g. -d+all): " dbg
+			exim $dbg -v -q $qid $qid 2>&1 | more
+		elif [[ $what = "f" ]]; then
+			read -p "Debug (e.g. -d+all): " dbg
+			exim $dbg -v -qff $qid $qid 2>&1 | more
+		elif [[ $what = "J" ]]; then
+			if confirm Joe-job-remove-all; then
+				for r in $(mailq $qid | tail -n +2); do
+					def_joe=${r#*@}
+				done
+				if [[ -n $joe ]]; then
+					echo "You are adding a domain to the list of joe-jobbed domains"
+					echo "currently the list is: $joe"
+					echo "Other options (sleep/frozen/step-over) are global to all such domains."
+				fi
+				pre_joe=$joe
+				read -p "Joe-jobbed domain [def: $def_joe] or (q)uit: " joe
+				if [[ $joe = "q" ]]; then
+					joe=
+				elif [[ $joe = "" ]]; then
+					joe="$pre_joe $def_joe"
+				else
+					joe="$pre_joe $joe"
+				fi
+				joe=$(echo "$joe"|tr A-Z a-z)
+				def_jj_sleep=$jj_sleep
+				read -p "Joe-job post-warning sleep (before delete) [def: $def_jj_sleep]: " jj_sleep
+				if [[ $jj_sleep = "" ]]; then
+					jj_sleep=$def_jj_sleep
+				fi
+				re_confirm "Limit to frozen messages" jj_ice "$jj_ice" "-z" ""
+				re_confirm "Step over non-matches" jj_only "$jj_only" "y" ""
+			fi
+		elif [[ $what = "l" ]]; then
+			exim -Mvl $qid 2>&1 | more
+		elif [[ $what = "R" ]]; then
+			read -p "New sender [def: $sender] or (q)uit: " sndr
+			if [[ $sndr != "q" ]]; then
+				if [[ $sndr = "" ]]; then
+					sndr=$sender
+				fi
+				exim -Mes $qid $sndr
+			fi
+		elif [[ $what = "A" ]]; then
+			read -p "New recipient [def: $add_rcpt] or (q)uit: " rcpt
+			if [[ $rcpt != "q" ]]; then
+				if [[ $rcpt = "" ]]; then
+					rcpt=$add_rcpt
+				fi
+				exim -Mar $qid $rcpt
+			fi
+		elif [[ $what = "v" ]]; then
+			if confirm view; then
+				do_view
+			fi
+		elif [[ $what = "b" ]]; then
+			confirm bounce && exim -Mg $qid && break
+		elif [[ $what = "e" ]]; then
+			exigrep $qid $mainlog 2>&1 | more
+		elif [[ $what = "E" ]]; then
+			o_qid=$(exigrep $qid $mainlog | awk '/^[0-9]/&&/ P=local /&&$6~/^R=/{q=$6;sub(/^R=/,"",q);print q;exit}')
+			if [[ -n $o_qid ]]; then
+				( echo Old qid: $o_qid; exigrep $o_qid $mainlog 2>&1 ) | more
+			else
+				echo No qid found for $qid.
+			fi
+		elif [[ $what = "s" ]]; then
+			for r in $(mailq $qid | tail -n +2); do
+				r=${r#*@}
+				test -z "$r" && break
+				read -p "Ignore e-mails to $r [yN] " yorn
+				[[ $yorn = "y" ]] && {
+					[[ -n $ignore_dom ]] && ignore_dom="$ignore_dom "
+					ignore_dom=$(echo "$ignore_dom$r" | tr A-Z a-z)
+				}
+			done
+		elif [[ $what = "m" ]]; then
+			for r in $(mailq $qid | tail -n +2); do
+				test -z "$r" && break
+				read -p "Mark $r delivered [yN] " yorn
+				[[ $yorn = "y" ]] && {
+					exim -Mmd $qid $r
+				}
+			done
+		elif [[ $what = "t" ]]; then
+			confirm thaw && exim -Mt $qid
+		elif [[ $what = "S" ]]; then
+			do_view || continue
+			exim -Mvh $qid | egrep -i '^[0-9][0-9]*I Message-Id: .*'"$bounce_mid_end"'>$'
+			res=$?
+			check_res $res 1 || continue
+			if [[ $res = 0 ]]; then
+				if exim -Mvh $qid | grep -i '^[0-9][0-9]* *X-Failed-Recipients:' > /dev/null; then
+					rp=$(exim -Mvb $qid | head -50 | sed -n 's/^Return-path: *<\(.*\)>$/\1/p')
+					if [[ -z $rp ]]; then
+						echo $banner
+						echo ERROR: No return-path, skipping
+						continue
+					fi
+				else
+					echo $banner
+					echo ERROR: No x-failed-r, skipping
+					continue
+				fi
+				confirm "spam failure from $rp" || continue
+			else
+				confirm spam || continue
+			fi
+			echo Sending to [$spambox] from [$rp]
+			{
+				if [[ $res = 0 ]]; then
+					exim -Mvb $qid |awk 'p==1{print;next}/This is a copy of the message/{p=1}'
+				elif [[ $res = 1 ]]; then
+					exim -Mvb $qid
+				fi
+			} | awk 'p==0&&!/^$/{p=1}p==1{print}' | exim -f "$rp" "$spambox"
+			check_res $?
+			do_rm && break
+		elif [[ $what = "n" ]]; then
+			break
+		elif [[ $what = "q" ]]; then
+			exit 2
+		fi
+		check_res $?
+	done
+done
